@@ -1,0 +1,5 @@
+# Ignore everything under dataset/
+dataset/*
+
+# But keep this specific folder and its contents
+!dataset/00train_test/

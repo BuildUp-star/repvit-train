@@ -1,0 +1,16 @@
+python train_from_existing_repvit.py \
+  --csv_dir dataset/00train_test \
+  --method triplet \
+  --model_name repvit_m1_0 \
+  --embed_dim 512 \
+  --freeze_ratio 0.8 \
+  --epochs 10 --batch_size 64 --fp16
+
+
+python train_from_existing_repvit.py \
+  --csv_dir dataset/00train_test \
+  --method pairs-bce \
+  --model_name repvit_m1_0 \
+  --embed_dim 512 \
+  --freeze_ratio 0.8 \
+  --epochs 10 --batch_size 128 --fp16
