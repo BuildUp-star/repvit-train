@@ -1,5 +1,9 @@
-# Ignore everything under dataset/
+# Ignore everything in dataset by default
 dataset/*
 
-# But keep this specific folder and its contents
+# Include files directly under 00train_test (but not its subfolders)
+!dataset/00train_test/*
+dataset/00train_test/*/
+
+# (Optional) If you want to allow the folder itself to exist in repo
 !dataset/00train_test/

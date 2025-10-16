@@ -24,37 +24,71 @@ def normalize(z): return F.normalize(z, dim=-1)
 # ----------------- datasets -----------------
 class PairDataset(Dataset):
     def __init__(self, pos_csv, neg_csv, transform):
+        import csv, os
         self.samples = []
-        if os.path.exists(pos_csv):
+        # 以 CSV 所在目录为基准，解析相对路径
+        base = None
+        if pos_csv and os.path.exists(pos_csv):
+            base = os.path.dirname(os.path.abspath(pos_csv))
+        if not base and neg_csv and os.path.exists(neg_csv):
+            base = os.path.dirname(os.path.abspath(neg_csv))
+        if not base:
+            base = "."
+
+        def _resolve(p):
+            return p if os.path.isabs(p) else os.path.join(base, p)
+
+        if pos_csv and os.path.exists(pos_csv):
             with open(pos_csv, 'r', encoding='utf-8') as f:
                 for r in csv.DictReader(f):
-                    self.samples.append((r['a'], r['b'], 1.0))
-        if os.path.exists(neg_csv):
+                    self.samples.append((_resolve(r['a']), _resolve(r['b']), 1.0))
+        if neg_csv and os.path.exists(neg_csv):
             with open(neg_csv, 'r', encoding='utf-8') as f:
                 for r in csv.DictReader(f):
-                    self.samples.append((r['a'], r['b'], 0.0))
+                    self.samples.append((_resolve(r['a']), _resolve(r['b']), 0.0))
+
         self.transform = transform
 
-    def __len__(self): return len(self.samples)
+    def __len__(self):
+        return len(self.samples)
+
     def __getitem__(self, i):
+        from PIL import Image
         a, b, y = self.samples[i]
-        ia = Image.open(a).convert("RGB")
-        ib = Image.open(b).convert("RGB")
-        return self.transform(ia), self.transform(ib), torch.tensor(y, dtype=torch.float32)
+        ia = Image.open(a).convert('RGB')
+        ib = Image.open(b).convert('RGB')
+        if self.transform:
+            ia = self.transform(ia)
+            ib = self.transform(ib)
+        return ia, ib, torch.tensor([y], dtype=torch.float32)
 
 class TripletDataset(Dataset):
     def __init__(self, csv_path, transform):
+        import csv, os
+        base = os.path.dirname(os.path.abspath(csv_path))
+
+        def _resolve(p):
+            return p if os.path.isabs(p) else os.path.join(base, p)
+
         with open(csv_path, 'r', encoding='utf-8') as f:
-            self.rows = [(r['anchor'], r['positive'], r['negative']) for r in csv.DictReader(f)]
+            self.rows = [(_resolve(r['anchor']), _resolve(r['positive']), _resolve(r['negative']))
+                         for r in csv.DictReader(f)]
         self.transform = transform
 
-    def __len__(self): return len(self.rows)
+    def __len__(self):
+        return len(self.rows)
+
     def __getitem__(self, i):
+        from PIL import Image
         a, p, n = self.rows[i]
-        ia = Image.open(a).convert("RGB")
-        ip = Image.open(p).convert("RGB")
-        ineg = Image.open(n).convert("RGB")
-        return self.transform(ia), self.transform(ip), self.transform(ineg)
+        ia = Image.open(a).convert('RGB')
+        ip = Image.open(p).convert('RGB')
+        inn = Image.open(n).convert('RGB')
+        if self.transform:
+            ia = self.transform(ia)
+            ip = self.transform(ip)
+            inn = self.transform(inn)
+        return ia, ip, inn
 
 # ----------------- model wrap -----------------
 class RepViTWithHead(nn.Module):
@@ -106,10 +140,17 @@ class BCEPairLoss(nn.Module):
 
 # ----------------- eval: 组内最近邻召回 -----------------
 def read_items(csv_path):
+    """用于评测：读取 test.csv 的 (path, class/group) 项，并把相对路径解析到 CSV 所在目录"""
+    import csv, os
     rows = []
+    base = os.path.dirname(os.path.abspath(csv_path))
+
+    def _resolve(p):
+        return p if os.path.isabs(p) else os.path.join(base, p)
+
     with open(csv_path, 'r', encoding='utf-8') as f:
         for r in csv.DictReader(f):
-            rows.append((r['path'], f"{r['class']}/{r['group']}"))
+            rows.append((_resolve(r['path']), f"{r['class']}/{r['group']}"))
     return rows
 
 @torch.no_grad()
