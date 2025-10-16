@@ -1,3 +1,7 @@
+# 新建环境可选
+# conda create -n repvit python=3.10 -y && conda activate repvit
+pip install "torch>=2.2" torchvision pillow "timm>=1.0.8" opencv-python
+
 python train_from_existing_repvit.py \
   --csv_dir dataset/00train_test \
   --method triplet \
