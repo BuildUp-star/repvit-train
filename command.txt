@@ -73,3 +73,5 @@ python train_from_existing_repvit.py \
   --fp16 \
   --log_every_sec 10 \
   --patience 0
+  
+  python train_from_existing_repvit.py   --csv_dir dataset/00train_test   --method pairs-bce   --model_name repvit_m1_0   --embed_dim 512   --freeze_ratio 0.8   --image_size 224   --batch_size 32   --epochs 10   --lr 3e-4   --num_workers 4   --save runs/repvit_embed_512.pt   --save_best runs/repvit_embed_512_best.pt
