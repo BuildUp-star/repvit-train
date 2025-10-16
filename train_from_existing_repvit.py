@@ -11,7 +11,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-
+from contextlib import nullcontext
+# --- 可选：DirectML (Qualcomm Elite X) 支持 ---
+# 如果你在 Windows on ARM / Snapdragon X Elite 上安装了 `pip install torch-directml`
+# 这里会自动启用 DML 设备以使用笔记本 GPU 训练；否则忽略。
+try:
+    import torch_directml as _dml
+    _DML_AVAILABLE = True
+except Exception:
+    _dML_AVAILABLE = False
+    _dml = None
 import timm  # 需要: pip install timm
 
 # ----------------- utils -----------------
@@ -259,7 +268,24 @@ def main():
 
     set_seed(args.seed)
     os.makedirs(os.path.dirname(args.save), exist_ok=True)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # -------------------- 设备选择（CUDA > DirectML > CPU） --------------------
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        runtime = 'cuda'
+    elif '_DML_AVAILABLE' in globals() and _DML_AVAILABLE:
+        device = _dml.device()
+        runtime = 'dml'
+    else:
+        device = torch.device('cpu')
+        runtime = 'cpu'
+    print(f"Device: {device} (runtime={runtime})")
+
+    # 仅在 CUDA 上启用 AMP/GradScaler；DML/CPU 关闭
+    use_amp = bool(args.fp16 and isinstance(device, torch.device) and device.type == 'cuda')
+    amp_autocast = torch.cuda.amp.autocast if use_amp else nullcontext
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # DataLoader 的 pin_memory 只在 CUDA 有意义
+    pin_mem = bool(isinstance(device, torch.device) and device.type == 'cuda')
     print(f"Device: {device}")
 
     # 1) 复用你指定的 timm 模型
@@ -290,20 +316,20 @@ def main():
         tri_csv = os.path.join(args.csv_dir, 'triplets.csv')
         ds = TripletDataset(tri_csv, tf_train)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
+                        num_workers=args.num_workers, pin_memory=pin_mem, drop_last=True)
         criterion = nn.TripletMarginLoss(margin=0.2, p=2.0)
     else:
         pos_csv = os.path.join(args.csv_dir, 'pairs_pos.csv')
         neg_csv = os.path.join(args.csv_dir, 'pairs_neg.csv')
         ds = PairDataset(pos_csv, neg_csv, tf_train)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=args.num_workers, pin_memory=True, drop_last=True)
+                        num_workers=args.num_workers, pin_memory=pin_mem, drop_last=True)
         criterion = BCEPairLoss(scale=20.0)
 
     # 4) 优化器
     optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                               lr=args.lr, weight_decay=1e-4)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+    #scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
     # 5) 训练 + 心跳日志 + 早停
     best_rec = -1.0
@@ -320,7 +346,8 @@ def main():
         for it, batch in enumerate(dl, start=1):
             optim.zero_grad(set_to_none=True)
             bsz = batch[0].size(0)  # 当前 batch 大小
-            with torch.cuda.amp.autocast(enabled=args.fp16):
+            #with torch.cuda.amp.autocast(enabled=args.fp16):
+            with amp_autocast():
                 if args.method == 'triplet':
                     xa, xp, xn = [t.to(device) for t in batch]
                     za, zp, zn = model(xa), model(xp), model(xn)
