@@ -14,3 +14,17 @@ python train_from_existing_repvit.py \
   --embed_dim 512 \
   --freeze_ratio 0.8 \
   --epochs 10 --batch_size 128 --fp16
+
+
+python train_from_existing_repvit.py \
+  --csv_dir dataset/00train_test \
+  --method triplet \
+  --model_name repvit_m1_0 \
+  --embed_dim 512 \
+  --freeze_ratio 0.8 \
+  --batch_size 64 \
+  --epochs 20 \
+  --fp16 \
+  --log_every_sec 10 \
+  --target_recall 0.80 \
+  --patience 3

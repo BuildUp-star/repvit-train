@@ -194,6 +194,11 @@ def main():
     ap.add_argument('--fp16', action='store_true')
     ap.add_argument('--save', type=str, default='runs/repvit_embed_512.pt')
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--log_every_sec', type=float, default=10.0, help='每隔多少秒打印一次训练进度')
+    ap.add_argument('--patience', type=int, default=3, help='Eval 指标若连续多少个 epoch 不提升则早停')
+    ap.add_argument('--target_recall', type=float, default=None, help='达到该group-NN recall@1阈值（0~1）则提前停止')
+    ap.add_argument('--save_best', type=str, default='runs/repvit_embed_512_best.pt', help='最佳模型单独保存路径')
+
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -244,12 +249,21 @@ def main():
                               lr=args.lr, weight_decay=1e-4)
     scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
 
-    # 5) 训练
+    # 5) 训练 + 心跳日志 + 早停
+    best_rec = -1.0
+    epochs_no_improve = 0
+
     for ep in range(1, args.epochs+1):
         model.train()
-        t0 = time.time(); loss_acc = 0.0
-        for it, batch in enumerate(dl):
+        t0 = time.time()
+        last_log = t0
+        loss_acc = 0.0
+        it_cnt = 0
+        seen_images = 0
+
+        for it, batch in enumerate(dl, start=1):
             optim.zero_grad(set_to_none=True)
+            bsz = batch[0].size(0)  # 当前 batch 大小
             with torch.cuda.amp.autocast(enabled=args.fp16):
                 if args.method == 'triplet':
                     xa, xp, xn = [t.to(device) for t in batch]
@@ -260,23 +274,67 @@ def main():
                     xa, xb, y = xa.to(device), xb.to(device), y.to(device)
                     za, zb = model(xa), model(xb)
                     loss = criterion(za, zb, y)
+
             scaler.scale(loss).backward()
             scaler.step(optim); scaler.update()
+
+            # 累计指标
+            it_cnt += 1
+            seen_images += bsz
             loss_acc += loss.item()
 
-        dt = time.time()-t0
-        print(f"[Epoch {ep}] loss={loss_acc/len(dl):.4f}  time={dt:.1f}s")
+            # === 心跳日志：每 args.log_every_sec 秒输出一次 ===
+            now = time.time()
+            if now - last_log >= args.log_every_sec:
+                elapsed = now - t0
+                avg_loss = loss_acc / it_cnt
+                ips = seen_images / max(elapsed, 1e-9)  # images per second
+                # 预估本 epoch ETA
+                total_it = len(dl)
+                eta_epoch = (elapsed / max(it_cnt,1)) * (total_it - it_cnt)
+                print(f"[Epoch {ep} | {it_cnt}/{total_it}] "
+                      f"avg_loss={avg_loss:.4f}  "
+                      f"speed={ips:.1f} img/s  "
+                      f"eta_epoch={eta_epoch:.1f}s")
+                last_log = now
+
+        # --- 一个 epoch 结束 ---
+        dt = time.time() - t0
+        epoch_loss = loss_acc / max(it_cnt,1)
+        print(f"[Epoch {ep} DONE] loss={epoch_loss:.4f}  time={dt:.1f}s")
 
         # 轻量评测（组内最近邻召回）
         test_csv = os.path.join(args.csv_dir, 'test.csv')
         rec = eval_group_recall(model, test_csv, args.image_size, device)
         if rec is not None:
             print(f"[Eval] group-NN recall@1 = {rec*100:.2f}%")
+            # 保存最佳
+            if rec > best_rec:
+                best_rec = rec
+                epochs_no_improve = 0
+                torch.save({'epoch': ep, 'model': model.state_dict(), 'args': vars(args)}, args.save_best)
+                print(f"[Best Improved] saved best to {args.save_best}")
+            else:
+                epochs_no_improve += 1
 
+            # 目标达成就提前停止
+            if args.target_recall is not None and rec >= args.target_recall:
+                print(f"[EarlyStop] 达到目标 recall {args.target_recall*100:.2f}% ，提前停止。")
+                break
+
+            # 早停：连续若干 epoch 无提升
+            if args.patience > 0 and epochs_no_improve >= args.patience:
+                print(f"[EarlyStop] 连续 {args.patience} 个 epoch 指标未提升，提前停止。")
+                break
+
+        # 常规保存（每个 epoch）
         torch.save({'epoch': ep, 'model': model.state_dict(), 'args': vars(args)}, args.save)
         print(f"[Saved] {args.save}")
 
     print("Done.")
+    if best_rec >= 0:
+        print(f"[Summary] best recall@1 = {best_rec*100:.2f}% | best_model: {args.save_best}")
+
 
 if __name__ == "__main__":
     main()

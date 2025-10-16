@@ -1,5 +1,6 @@
 # Ignore everything in dataset by default
 dataset/*
+runs/*
 
 # Include files directly under 00train_test (but not its subfolders)
 !dataset/00train_test/*
