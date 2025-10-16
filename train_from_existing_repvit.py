@@ -371,7 +371,24 @@ def main():
             mr  = metrics["macro_recall"]
             mf1 = metrics["macro_f1"]
             print(f"[Eval] 1-NN accuracy={acc*100:.2f}% | macro P={mp*100:.2f}% R={mr*100:.2f}% F1={mf1*100:.2f}%")
+            # === 阈值式回环评测：给出最佳阈值 τ* ===
+            thr_report = eval_threshold_metrics(
+                model, test_csv, args.image_size, device,
+                thr_list=None,          # 默认 0.2~0.99 扫
+                pos_rule="same_group",  # test.csv 中同 class/group 视为回环
+                max_pairs=500_000,      # 按需调整
+                min_index_gap=0         # 如按时间序列评测可设成 5/10 等
+            )
+            best_thr = thr_report["best"]["thr"]
+            best_f1  = thr_report["best"]["f1"]
+            print(f"[ThresholdEval] best τ* = {best_thr:.3f}  (F1={best_f1:.3f})")
 
+            # 若你更关心“召回≥X%下的最高精度”
+            sel = choose_threshold_by_target_recall(thr_report["curve"], target_recall=0.90)
+            print(f"[ThresholdEval@Recall≥90%] τ = {sel['thr']:.3f} | "
+                  f"P={sel['precision']:.3f} R={sel['recall']:.3f} F1={sel['f1']:.3f} ({sel['by']})")
+
+            
             # 用 accuracy 作为“早停/最佳”指标（也可换成 macro_f1）
             if acc > best_rec:
                 best_rec = acc
@@ -397,6 +414,105 @@ def main():
     print("Done.")
     if best_rec >= 0:
         print(f"[Summary] best accuracy = {best_rec*100:.2f}% | best_model: {args.save_best}")
+
+# ========= threshold-based binary evaluation for loop detection =========
+@torch.no_grad()
+def eval_threshold_metrics(model, test_csv, image_size, device,
+                           thr_list=None, pos_rule="same_group",
+                           max_pairs=1_000_000, min_index_gap=0):
+    """
+    使用 cosine 相似度 + 阈值进行二分类评测（回环检测）。
+    返回：每个阈值的 (precision, recall, f1, tp, fp, fn)，以及最佳阈值。
+    - pos_rule: "same_group" 表示同 class/group 视为正例
+    - min_index_gap: 过滤过近的帧索引差（如同序列内临近帧），避免 trivial positives
+    """
+    import numpy as np
+    from PIL import Image
+    from torchvision import transforms
+
+    if thr_list is None:
+        thr_list = np.linspace(0.2, 0.99, 80)
+
+    rows = read_items(test_csv)  # [(path, "class/group"), ...]
+    tfm = transforms.Compose([
+        transforms.Resize(image_size),
+        transforms.CenterCrop(image_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
+    ])
+
+    # 1) 提取 embedding 与标签
+    embs, groups, paths = [], [], []
+    model.eval()
+    for path, gid in rows:
+        x = tfm(Image.open(path).convert('RGB')).unsqueeze(0).to(device)
+        z = model(x).cpu().numpy()[0]
+        embs.append(z); groups.append(gid); paths.append(path)
+    embs = np.stack(embs, 0)
+    embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
+
+    N = len(embs)
+    sims = embs @ embs.T
+    np.fill_diagonal(sims, -2.0)  # 排除自比对
+
+    # 2) 构建标签矩阵（正例/负例）
+    groups = np.array(groups)
+    if pos_rule == "same_group":
+        y_true = (groups[:, None] == groups[None, :])
+    else:
+        raise ValueError("unknown pos_rule")
+    np.fill_diagonal(y_true, False)
+
+    # 3) 可选：过滤过近的索引对（避免临近帧当正例）
+    if min_index_gap > 0:
+        idx = np.arange(N)
+        too_close = (np.abs(idx[:, None] - idx[None, :]) < min_index_gap)
+        y_true = np.where(too_close, False, y_true)
+
+    # 4) 只取上三角以减少重复
+    iu = np.triu_indices(N, k=1)
+    s = sims[iu]; y = y_true[iu]
+
+    # 5) 采样（大数据集防爆内存）
+    if s.shape[0] > max_pairs:
+        sel = np.random.choice(s.shape[0], size=max_pairs, replace=False)
+        s = s[sel]; y = y[sel]
+
+    # 6) 扫阈值并计算 P/R/F1
+    out = []
+    best = (-1.0, None)  # (best_f1, best_thr)
+    for thr in thr_list:
+        y_pred = (s >= thr)
+        TP = int(np.sum(y_pred & y))
+        FP = int(np.sum(y_pred & ~y))
+        FN = int(np.sum((~y_pred) & y))
+        prec = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+        rec  = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+        f1   = (2*prec*rec)/(prec+rec) if (prec+rec) > 0 else 0.0
+        out.append({"thr": float(thr), "precision": float(prec),
+                    "recall": float(rec), "f1": float(f1),
+                    "tp": TP, "fp": FP, "fn": FN})
+        if f1 > best[0]:
+            best = (f1, thr)
+
+    return {
+        "curve": out,
+        "best": {"thr": float(best[1]), "f1": float(best[0])}
+    }
+
+def choose_threshold_by_target_recall(curve, target_recall=0.90):
+    """
+    在达到 target_recall 的所有点里，选择 precision 最大（或 f1 最大）。
+    """
+    cands = []#[r for r in curve if r["recall"] >= target_recall]
+    if not cands:
+        # 回退到全局 F1 最大
+        best = max(curve, key=lambda r: r["f1"])
+        return {"thr": best["thr"], "precision": best["precision"],
+                "recall": best["recall"], "f1": best["f1"], "by": "max_f1"}
+    best = max(cands, key=lambda r: (r["precision"], r["f1"]))
+    return {"thr": best["thr"], "precision": best["precision"],
+            "recall": best["recall"], "f1": best["f1"], "by": f"target_recall≥{target_recall}"}
 
 
 if __name__ == "__main__":
