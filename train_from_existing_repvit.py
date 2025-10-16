@@ -154,15 +154,23 @@ def read_items(csv_path):
     return rows
 
 @torch.no_grad()
-def eval_group_recall(model, test_csv, image_size, device):
-    if not os.path.exists(test_csv): return None
-    rows = read_items(test_csv)
+def eval_group_metrics(model, test_csv, image_size, device, save_confusion_csv=None):
+    """
+    评测最近邻(1-NN)分类的多指标：accuracy (= micro P/R), macro P/R/F1，和可选混淆矩阵。
+    返回一个 dict，含各项指标。
+    """
+    if not os.path.exists(test_csv):
+        return None
+
+    rows = read_items(test_csv)  # [(path, "class/group"), ...]
     tfm = transforms.Compose([
         transforms.Resize(image_size),
         transforms.CenterCrop(image_size),
         transforms.ToTensor(),
         transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
     ])
+
+    # 1) 提取 embedding 与标签
     embs, groups = [], []
     model.eval()
     for path, gid in rows:
@@ -170,12 +178,60 @@ def eval_group_recall(model, test_csv, image_size, device):
         z = model(x).cpu().numpy()[0]
         embs.append(z); groups.append(gid)
     embs = np.stack(embs, 0)
-    embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True)+1e-9)
+    embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
+
+    # 2) 1-NN 预测
     sims = embs @ embs.T
     np.fill_diagonal(sims, -1.0)
     nn_idx = sims.argmax(1)
-    hits = sum(1 for i,j in enumerate(nn_idx) if groups[i]==groups[j])
-    return hits/len(rows)
+    y_true = np.array(groups)
+    y_pred = np.array([groups[j] for j in nn_idx])
+
+    # 3) 映射到整数标签，便于统计
+    labels = sorted(list(set(groups)))
+    lid = {g:i for i,g in enumerate(labels)}
+    yt = np.array([lid[g] for g in y_true], dtype=np.int64)
+    yp = np.array([lid[g] for g in y_pred], dtype=np.int64)
+    C = len(labels)
+
+    # 4) 统计 TP/FP/FN（逐类）
+    conf = np.zeros((C, C), dtype=np.int64)  # [true, pred]
+    for t, p in zip(yt, yp):
+        conf[t, p] += 1
+
+    per_prec, per_rec, per_f1 = [], [], []
+    for c in range(C):
+        TP = conf[c, c]
+        FP = conf[:, c].sum() - TP
+        FN = conf[c, :].sum() - TP
+        prec = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+        rec  = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+        f1   = (2*prec*rec)/(prec+rec) if (prec+rec) > 0 else 0.0
+        per_prec.append(prec); per_rec.append(rec); per_f1.append(f1)
+
+    macro_p = float(np.mean(per_prec))
+    macro_r = float(np.mean(per_rec))
+    macro_f1 = float(np.mean(per_f1))
+    accuracy = float(np.trace(conf)) / max(len(yt), 1)  # 也等于 micro-precision/micro-recall
+
+    # 可选：把混淆矩阵存成 CSV，便于排查具体混淆对
+    if save_confusion_csv is not None:
+        import csv
+        os.makedirs(os.path.dirname(save_confusion_csv), exist_ok=True)
+        with open(save_confusion_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([""] + labels)  # header: 预测列名
+            for i, g in enumerate(labels):
+                writer.writerow([g] + conf[i].tolist())
+
+    return {
+        "accuracy": accuracy,            # = micro P/R
+        "macro_precision": macro_p,
+        "macro_recall": macro_r,
+        "macro_f1": macro_f1,
+        "num_classes": C,
+        "support": conf.sum(axis=1).tolist(),  # 每类样本数
+    }
 
 # ----------------- train -----------------
 def main():
@@ -195,7 +251,7 @@ def main():
     ap.add_argument('--save', type=str, default='runs/repvit_embed_512.pt')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--log_every_sec', type=float, default=10.0, help='每隔多少秒打印一次训练进度')
-    ap.add_argument('--patience', type=int, default=3, help='Eval 指标若连续多少个 epoch 不提升则早停')
+    ap.add_argument('--patience', type=int, default=0, help='Eval 指标若连续多少个 epoch 不提升则早停')
     ap.add_argument('--target_recall', type=float, default=None, help='达到该group-NN recall@1阈值（0~1）则提前停止')
     ap.add_argument('--save_best', type=str, default='runs/repvit_embed_512_best.pt', help='最佳模型单独保存路径')
 
@@ -305,27 +361,34 @@ def main():
 
         # 轻量评测（组内最近邻召回）
         test_csv = os.path.join(args.csv_dir, 'test.csv')
-        rec = eval_group_recall(model, test_csv, args.image_size, device)
-        if rec is not None:
-            print(f"[Eval] group-NN recall@1 = {rec*100:.2f}%")
-            # 保存最佳
-            if rec > best_rec:
-                best_rec = rec
+        metrics = eval_group_metrics(
+            model, test_csv, args.image_size, device,
+            save_confusion_csv=os.path.join(os.path.dirname(args.save), "confusion_test.csv")
+        )
+        if metrics is not None:
+            acc = metrics["accuracy"]
+            mp  = metrics["macro_precision"]
+            mr  = metrics["macro_recall"]
+            mf1 = metrics["macro_f1"]
+            print(f"[Eval] 1-NN accuracy={acc*100:.2f}% | macro P={mp*100:.2f}% R={mr*100:.2f}% F1={mf1*100:.2f}%")
+
+            # 用 accuracy 作为“早停/最佳”指标（也可换成 macro_f1）
+            if acc > best_rec:
+                best_rec = acc
                 epochs_no_improve = 0
                 torch.save({'epoch': ep, 'model': model.state_dict(), 'args': vars(args)}, args.save_best)
                 print(f"[Best Improved] saved best to {args.save_best}")
             else:
                 epochs_no_improve += 1
 
-            # 目标达成就提前停止
-            if args.target_recall is not None and rec >= args.target_recall:
-                print(f"[EarlyStop] 达到目标 recall {args.target_recall*100:.2f}% ，提前停止。")
+            if args.target_recall is not None and acc >= args.target_recall:
+                print(f"[EarlyStop] 达到目标 accuracy {args.target_recall*100:.2f}% ，提前停止。")
                 break
 
-            # 早停：连续若干 epoch 无提升
             if args.patience > 0 and epochs_no_improve >= args.patience:
                 print(f"[EarlyStop] 连续 {args.patience} 个 epoch 指标未提升，提前停止。")
                 break
+
 
         # 常规保存（每个 epoch）
         torch.save({'epoch': ep, 'model': model.state_dict(), 'args': vars(args)}, args.save)
@@ -333,7 +396,7 @@ def main():
 
     print("Done.")
     if best_rec >= 0:
-        print(f"[Summary] best recall@1 = {best_rec*100:.2f}% | best_model: {args.save_best}")
+        print(f"[Summary] best accuracy = {best_rec*100:.2f}% | best_model: {args.save_best}")
 
 
 if __name__ == "__main__":

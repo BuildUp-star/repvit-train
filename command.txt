@@ -2,6 +2,41 @@
 # conda create -n repvit python=3.10 -y && conda activate repvit
 pip install "torch>=2.2" torchvision pillow "timm>=1.0.8" opencv-python
 
+Windows 原生环境安装（不要在 WSL 里装）
+
+# 新建并激活 venv（示例）
+py -m venv .venv && .\.venv\Scripts\activate
+pip install --upgrade pip
+pip install torch-directml  # PyTorch 的 DirectML 设备
+pip install timm pillow torchvision  # 你脚本里用到的包
+
+
+参考：PyTorch-DirectML 官方安装与示例；PyPI 也说明了在 Windows 可用。
+Microsoft Learn
++2
+PyPI
++2
+
+代码里切到 DirectML 设备
+把原来 device = torch.device('cuda' if ... else 'cpu') 一段替换成：
+
+try:
+    import torch_directml
+    dml_device = torch_directml.device()
+    device = dml_device  # DirectML 设备名通常就是 "dml"
+    print("Using DirectML (GPU) device")
+except Exception as e:
+    device = torch.device("cpu")
+    print("Falling back to CPU:", e)
+
+model = model.to(device)
+# 所有 batch 的张量也要 .to(device)
+# example:
+# xa, xb, y = xa.to(device), xb.to(device), y.to(device)
+
+
+
+
 python train_from_existing_repvit.py \
   --csv_dir dataset/00train_test \
   --method triplet \
@@ -30,5 +65,4 @@ python train_from_existing_repvit.py \
   --epochs 20 \
   --fp16 \
   --log_every_sec 10 \
-  --target_recall 0.80 \
-  --patience 3
+  --patience 0
