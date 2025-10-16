@@ -35,6 +35,13 @@ model = model.to(device)
 # xa, xb, y = xa.to(device), xb.to(device), y.to(device)
 
 
+import torch import timm 
+# 1. 建立同样结构的模型 
+model_name = "repvit_m1_0" 
+model = timm.create_model(model_name, pretrained=False) 
+# 2. 加载权重 
+state_dict = torch.load("repvit_m1_0_weights_only.pth", map_location="cpu") 
+model.load_state_dict(state_dict) model.eval()
 
 
 python train_from_existing_repvit.py \
