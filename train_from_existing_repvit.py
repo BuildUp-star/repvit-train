@@ -138,13 +138,34 @@ def freeze_by_ratio(module: nn.Module, ratio: float):
         p.requires_grad = (i >= cutoff)
 
 # ----------------- losses -----------------
-class BCEPairLoss(nn.Module):
+class BCEPairLossB(nn.Module):
     def __init__(self, scale=20.0):
         super().__init__()
         self.scale = scale
         self.crit = nn.BCEWithLogitsLoss()
     def forward(self, za, zb, y):
-        logit = (za * zb).sum(-1) * self.scale
+        logit = (za * zb).sum(-1) * self.scale       # [B]
+        y = y.float().reshape_as(logit)              # ✅ 对齐形状与类型
+        return self.crit(logit, y)
+        
+import torch.nn.functional as F
+
+class BCEPairLoss(nn.Module):
+    def __init__(self, scale=20.0, normalize=True, pos_weight=None):
+        super().__init__()
+        self.scale = scale
+        self.normalize = normalize
+        self.crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    def forward(self, za, zb, y):
+        # 可选：L2 归一化 → 余弦相似度
+        if self.normalize:
+            za = F.normalize(za, dim=1)
+            zb = F.normalize(zb, dim=1)
+        s = (za * zb).sum(dim=1)             # [B]
+        logit = s * self.scale               # [B]
+        y = y.float().reshape_as(logit)      # [B]
+        # 若标签为 {-1,+1}，取消注释下一行
+        # y = (y > 0).float()
         return self.crit(logit, y)
 
 # ----------------- eval: 组内最近邻召回 -----------------
