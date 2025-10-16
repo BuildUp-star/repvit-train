@@ -310,7 +310,12 @@ def main():
     print(f"Device: {device}")
 
     # 1) 复用你指定的 timm 模型
-    backbone = timm.create_model(args.model_name, pretrained=True).eval()
+    #backbone = timm.create_model(args.model_name, pretrained=True).eval()
+    model_name = "repvit_m1_0"
+    model = timm.create_model(model_name, pretrained=False)
+    state_dict = torch.load("models/repvit_m1_0_weights_only.pth", map_location="cpu")
+    model.load_state_dict(state_dict)
+    backbone = model.eval()
     # 移除分类头 + 开池化
     if hasattr(backbone, 'reset_classifier'):
         backbone.reset_classifier(num_classes=0, global_pool='avg')
