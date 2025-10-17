@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os, csv, argparse, random, time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import numpy as np
 from PIL import Image
 
@@ -187,6 +187,61 @@ class BCEAtFixedThresholdLoss(nn.Module):
        logit = (s - self.tau) * self.scale  # 把 τ 移进 logit
        y = y.float().reshape_as(logit)
        return self.crit(logit, y)
+# ----------------- TauPullPushLoss -----------------
+class TauPullPushLoss(nn.Module):
+    """
++    TauPullPushLoss = 判别项(阈值对齐) + 拉近/推远项(极值正则)
++      - 判别项：以固定阈值 τ 为决策面（s=cos≥τ 判正），与部署一致
++      - 拉近/推远：正样本持续往 +1 拉、负样本持续往 −1 推（即便已在 τ 正确一侧）
++    形式：
++      L_pos = softplus(-alpha*(s-τ))  + λ_pull*(1-s)^2
++      L_neg = softplus( alpha*(s-τ))  + λ_push*(s+1)^2
++      L = w_tau * [ y*L_pos + (1-y)*L_neg ] （可叠加 pos_weight）
++      其中 w_tau = exp(- (s-τ)^2 / (2*sigma^2)) 为 τ-聚焦（可关）
++    """
+    def __init__(self,
+                tau: float = 0.60,
+                alpha: float = 10.0,
+                lambda_pull: float = 0.2,
+                lambda_push: float = 0.2,
+                normalize: bool = True,
+                pos_weight: Optional[float] = None,
+                use_tau_focus: bool = True,
+                sigma_tau: float = 0.15):
+       super().__init__()
+       self.tau = float(tau)
+       self.alpha = float(alpha)
+       self.lambda_pull = float(lambda_pull)
+       self.lambda_push = float(lambda_push)
+       self.normalize = normalize
+       self.pos_weight = pos_weight
+       self.use_tau_focus = use_tau_focus
+       self.sigma_tau = float(sigma_tau)
+
+    def forward(self, za: torch.Tensor, zb: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+       if self.normalize:
+           za = F.normalize(za, dim=1)
+           zb = F.normalize(zb, dim=1)
+       s = (za * zb).sum(dim=1)                 # 余弦相似度 ∈ [-1,1]
+       y = y.float().view_as(s)
+       # 判别项：以 τ 为中心的对称 softplus（数值稳定、在 τ 附近有梯度）
+       cls_pos = F.softplus(-self.alpha * (s - self.tau))   # y=1
+       cls_neg = F.softplus( self.alpha * (s - self.tau))   # y=0
+       # 拉近/推远项：把正对往 +1 拉、负对往 −1 推
+       pull = (1.0 - s).pow(2)                               # y=1
+       push = (s + 1.0).pow(2)                               # y=0
+       # τ-聚焦：越靠近 τ 权重越大（可关）
+       if self.use_tau_focus:
+           w_tau = torch.exp(-((s - self.tau) ** 2) / (2 * (self.sigma_tau ** 2)))
+       else:
+           w_tau = torch.ones_like(s)
+       # 类别不均衡权重
+       w_pos = float(self.pos_weight) if self.pos_weight is not None else 1.0
+       w_neg = 1.0
+       loss_pos = w_tau * (cls_pos + self.lambda_pull * pull)
+       loss_neg = w_tau * (cls_neg + self.lambda_push * push)
+       loss = y * (w_pos * loss_pos) + (1.0 - y) * (w_neg * loss_neg)
+       return loss.mean()
 
 # ----------------- eval: 组内最近邻召回 -----------------
 def read_items(csv_path):
@@ -287,7 +342,7 @@ def eval_group_metrics(model, test_csv, image_size, device, save_confusion_csv=N
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--csv_dir', type=str, default='dataset/00train_test')
-    ap.add_argument('--method', type=str, choices=['triplet','pairs-bce'], default='triplet')
+    ap.add_argument('--method', type=str, choices=['triplet','pairs-bce','pairs-tpp'], default='triplet')
     ap.add_argument('--model_name', type=str, default='repvit_m1_0')
     ap.add_argument('--embed_dim', type=int, default=512)
     ap.add_argument('--freeze_ratio', type=float, default=0.8, help='冻结前多少比例参数 (0~1)')
@@ -306,6 +361,13 @@ def main():
     ap.add_argument('--save_best', type=str, default='runs/repvit_embed_512_best.pt', help='最佳模型单独保存路径')
     ap.add_argument('--tau', type=float, default=0.60, help='固定阈值训练/评测所用的 cosine 阈值 τ')
     ap.add_argument('--bce_at_tau', action='store_true', help='pairs 模式下：使用“阈值对齐 BCE”训练（logit=scale*(cos-τ)）')
+    # ---- TauPullPushLoss 相关超参 ----
+    ap.add_argument('--pos_weight', type=float, default=None, help='正样本权重（类别不均衡时可设为 neg/pos 比）')
+    ap.add_argument('--tpp_alpha', type=float, default=10.0, help='TauPullPush 的斜率 alpha（8~12 防饱和）')
+    ap.add_argument('--tpp_pull',  type=float, default=0.2,  help='正样本拉近权重 λ_pull')
+    ap.add_argument('--tpp_push',  type=float, default=0.2,  help='负样本推远权重 λ_push')
+    ap.add_argument('--tpp_sigma', type=float, default=0.15, help='τ-聚焦的带宽 sigma（越小越聚焦边界）')
+    ap.add_argument('--no_tau_focus', action='store_true', help='关闭 τ-聚焦权重（默认开启）')
 
     args = ap.parse_args()
 
@@ -372,10 +434,21 @@ def main():
         ds = PairDataset(pos_csv, neg_csv, tf_train)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=pin_mem, drop_last=True)
-        if args.bce_at_tau:
-            criterion = BCEAtFixedThresholdLoss(tau=args.tau, scale=20.0)
+        if args.method == 'pairs-tpp':
+           criterion = TauPullPushLoss(
+               tau=args.tau,
+               alpha=args.tpp_alpha,
+               lambda_pull=args.tpp_pull,
+               lambda_push=args.tpp_push,
+               normalize=True,
+               pos_weight=args.pos_weight,
+               use_tau_focus=(not args.no_tau_focus),
+               sigma_tau=args.tpp_sigma
+           )
+        elif args.bce_at_tau:
+            criterion = BCEAtFixedThresholdLoss(tau=args.tau, scale=20.0, pos_weight=args.pos_weight)
         else:
-            criterion = BCEPairLoss(scale=20.0)
+            criterion = BCEPairLoss(scale=20.0, pos_weight=args.pos_weight)
 
     # 4) 优化器
     optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
