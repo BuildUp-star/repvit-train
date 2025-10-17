@@ -168,6 +168,26 @@ class BCEPairLoss(nn.Module):
         # y = (y > 0).float()
         return self.crit(logit, y)
 
+class BCEAtFixedThresholdLoss(nn.Module):
+   """
+   把判别阈值 τ 直接编码进 logit：logit = scale * (cosine - τ)。
+   这样用 BCEWithLogitsLoss 训练，模型就会直接朝着“s >= τ 判正”的目标优化。
+   """
+   def __init__(self, tau=0.60, scale=20.0, normalize=True, pos_weight=None):
+       super().__init__()
+       self.tau = float(tau)
+       self.scale = float(scale)
+       self.normalize = normalize
+       self.crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+   def forward(self, za, zb, y):
+       if self.normalize:
+           za = F.normalize(za, dim=1)
+           zb = F.normalize(zb, dim=1)
+       s = (za * zb).sum(dim=1)             # [B]  余弦相似度
+       logit = (s - self.tau) * self.scale  # 把 τ 移进 logit
+       y = y.float().reshape_as(logit)
+       return self.crit(logit, y)
+
 # ----------------- eval: 组内最近邻召回 -----------------
 def read_items(csv_path):
     """用于评测：读取 test.csv 的 (path, class/group) 项，并把相对路径解析到 CSV 所在目录"""
@@ -284,6 +304,8 @@ def main():
     ap.add_argument('--patience', type=int, default=0, help='Eval 指标若连续多少个 epoch 不提升则早停')
     ap.add_argument('--target_recall', type=float, default=None, help='达到该group-NN recall@1阈值（0~1）则提前停止')
     ap.add_argument('--save_best', type=str, default='runs/repvit_embed_512_best.pt', help='最佳模型单独保存路径')
+    ap.add_argument('--tau', type=float, default=0.60, help='固定阈值训练/评测所用的 cosine 阈值 τ')
+    ap.add_argument('--bce_at_tau', action='store_true', help='pairs 模式下：使用“阈值对齐 BCE”训练（logit=scale*(cos-τ)）')
 
     args = ap.parse_args()
 
@@ -350,7 +372,10 @@ def main():
         ds = PairDataset(pos_csv, neg_csv, tf_train)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=pin_mem, drop_last=True)
-        criterion = BCEPairLoss(scale=20.0)
+        if args.bce_at_tau:
+            criterion = BCEAtFixedThresholdLoss(tau=args.tau, scale=20.0)
+        else:
+            criterion = BCEPairLoss(scale=20.0)
 
     # 4) 优化器
     optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
@@ -440,6 +465,17 @@ def main():
             sel = choose_threshold_by_target_recall(thr_report["curve"], target_recall=0.90)
             print(f"[ThresholdEval@Recall≥90%] τ = {sel['thr']:.3f} | "
                   f"P={sel['precision']:.3f} R={sel['recall']:.3f} F1={sel['f1']:.3f} ({sel['by']})")
+            # 额外：在“固定 τ=args.tau”处，直接打印二分类指标，便于和你的部署阈值一致
+            fixed = [r for r in thr_report["curve"] if abs(r["thr"] - args.tau) < 1e-9]
+            if not fixed:
+                # 若 τ 恰不在扫描网格，做一次单点评测
+                fixed_report = eval_threshold_metrics(
+                    model, test_csv, args.image_size, device,
+                    thr_list=[args.tau], pos_rule="same_group"
+                )
+                fixed = [fixed_report["curve"][0]]
+            fr = fixed[0]
+            print(f"[ThresholdEval@τ={args.tau:.3f}] P={fr['precision']:.3f} R={fr['recall']:.3f} F1={fr['f1']:.3f}")
 
             
             # 用 accuracy 作为“早停/最佳”指标（也可换成 macro_f1）
