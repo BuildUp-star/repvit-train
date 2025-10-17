@@ -90,3 +90,11 @@ python train_from_existing_repvit.py \
   --num_workers 4 \
   --save runs/repvit_embed_512.pt \
   --save_best runs/repvit_embed_512_best.pt
+  
+  python train_from_existing_repvit.py \
+  --method pairs-tpp \
+  --tau 0.60 \
+  --tpp_alpha 10.0 --tpp_pull 0.2 --tpp_push 0.2 --tpp_sigma 0.15 \
+  --pos_weight 2.0      
+  
+  # 例如负样本≈正样本两倍
