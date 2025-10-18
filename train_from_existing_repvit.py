@@ -129,6 +129,48 @@ class RepViTWithHead(nn.Module):
         f = self.backbone(x)          # (B, feat_dim)，已全局池化
         z = self.head(f)              # (B, embed_dim)
         return normalize(z)           # 归一化，便于余弦相似
+        
+def l2_normalize(x, eps=1e-12):
+    return x / (x.norm(p=2, dim=-1, keepdim=True).clamp_min(eps))
+
+class RepViTWithLogitHead(nn.Module):
+    """
+    不改动/不重置 backbone（timm RepViT），直接在 logits 后面接 512-d embedding head。
+    适用于你的“logits dim = 1000, features dim = 448”的场景。
+    """
+    def __init__(self, backbone: nn.Module, embed_dim=512, mlp=False, norm=True):
+        super().__init__()
+        self.backbone = backbone  # 不调用 reset_classifier，不动它
+        self.norm = norm
+
+        # 尝试直接从模型属性拿 logits 维度（num_classes）
+        in_dim = getattr(self.backbone, 'num_classes', None)
+
+        # 兜底：跑一次 dummy 推理推断 logits 维度（注意不会反传梯度）
+        if in_dim is None or in_dim == 0:
+            with torch.no_grad():
+                dummy = torch.zeros(1, 3, 224, 224)
+                logits = self.backbone(dummy)
+                if isinstance(logits, (list, tuple)):
+                    logits = logits[0]
+                in_dim = logits.shape[-1]
+
+        if mlp:
+            self.head = nn.Sequential(
+                nn.Linear(in_dim, in_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(in_dim, embed_dim),
+            )
+        else:
+            self.head = nn.Linear(in_dim, embed_dim)
+
+    def forward(self, x):
+        # timm 的 forward 默认返回分类 logits（未经 softmax）
+        logits = self.backbone(x)                 # (B, num_classes)
+        if isinstance(logits, (list, tuple)):     # 保险：有些模型可能返回额外输出
+            logits = logits[0]
+        z = self.head(logits)                     # (B, embed_dim)
+        return l2_normalize(z) if self.norm else z
 
 def freeze_by_ratio(module: nn.Module, ratio: float):
     """按参数次序冻结前 ratio 比例（0~1）。不依赖具体层名，通用且稳妥。"""
@@ -404,7 +446,7 @@ def main():
     if hasattr(backbone, 'reset_classifier'):
         backbone.reset_classifier(num_classes=0, global_pool='avg')
 
-    model = RepViTWithHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
+    model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
 
     # 2) 冻结前面一部分参数
     freeze_by_ratio(model.backbone, args.freeze_ratio)
