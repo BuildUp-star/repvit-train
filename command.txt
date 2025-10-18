@@ -98,3 +98,56 @@ python train_from_existing_repvit.py \
   --pos_weight 2.0      
   
   # 例如负样本≈正样本两倍
+  
+  
+# 相似度调试：读取CSV并分析分布，打印最难正/负例各20对，并把配对相似度导出到CSV
+python debug_sims.py \
+  --csv dataset/00train_test/test.csv \
+  --base_dir dataset/00train_test \
+  --topk 20 \
+  --save_csv runs/sims_debug.csv
+
+
+# 打印所有“异组且余弦相似度 > 0.7”的配对，仅在屏幕显示
+python print_high_neg_pairs.py \
+  --csv dataset/00train_test/test.csv \
+  --base_dir dataset/00train_test \
+  --threshold 0.7
+
+# 同上，但加载你微调后的权重（更贴近训练后的实际表现）
+python print_high_neg_pairs.py \
+  --csv dataset/00train_test/test.csv \
+  --base_dir dataset/00train_test \
+  --checkpoint runs/repvit_embed_512_best.pt \
+  --threshold 0.7
+
+
+# 将命中的高相似“负例”配对写入CSV，并限制屏幕打印数量避免刷屏
+python print_high_neg_pairs.py \
+  --csv dataset/00train_test/test.csv \
+  --base_dir dataset/00train_test \
+  --threshold 0.7 \
+  --save_csv runs/high_neg_pairs.csv \
+  --max_print 200
+
+# pair 对数。 把结果重定向保存到文本文件（可选）
+python count_pairs.py --csv dataset/00train_test/test.csv > runs/pair_count_test.txt
+
+直接打印全部 POS 分数
+python print_pos_pairs.py \
+  --csv dataset/00train_test/test.csv \
+  --base_dir dataset/00train_test
+  # 用你训练后的权重、按分数从高到低排序打印
+python print_pos_pairs.py \
+  --csv dataset/00train_test/test.csv \
+  --base_dir dataset/00train_test \
+  --checkpoint runs/repvit_embed_512_best.pt \
+  --sort desc
+
+# 保存到 CSV（全部 POS pair 都会写入），并限制屏幕打印条数
+python print_pos_pairs.py \
+  --csv dataset/00train_test/test.csv \
+  --sort desc\
+  --base_dir dataset/00train_test \
+  --save_csv runs/pos_pairs_sorted.csv \
+  --max_print 500
