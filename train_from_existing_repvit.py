@@ -19,7 +19,7 @@ try:
     import torch_directml as _dml
     _DML_AVAILABLE = True
 except Exception:
-    _dML_AVAILABLE = False
+    _DML_AVAILABLE = False
     _dml = None
 import timm  # 需要: pip install timm
 
@@ -171,6 +171,27 @@ class RepViTWithLogitHead(nn.Module):
             logits = logits[0]
         z = self.head(logits)                     # (B, embed_dim)
         return l2_normalize(z) if self.norm else z
+        
+class LogitsAsEmbedding(nn.Module):
+    """
+    直接用模型最后一层输出（logits）作为 embedding。
+    - 不 reset、不移除分类头。
+    - 默认做 L2 归一化，便于用余弦相似度。
+    """
+    def __init__(self, backbone: nn.Module, l2norm: bool = True):
+        super().__init__()
+        self.backbone = backbone
+        self.l2norm = l2norm
+
+    def forward(self, x):
+        # timm 模型通常返回 (B, num_classes) 的 logits
+        out = self.backbone(x)
+        # 兼容某些模型返回 tuple/list 或者空间张量
+        if isinstance(out, (list, tuple)):
+            out = out[0]
+        if out.ndim > 2:
+            out = out.flatten(1)
+        return F.normalize(out, p=2, dim=-1) if self.l2norm else out
 
 def freeze_by_ratio(module: nn.Module, ratio: float):
     """按参数次序冻结前 ratio 比例（0~1）。不依赖具体层名，通用且稳妥。"""
@@ -443,16 +464,20 @@ def main():
     model.load_state_dict(state_dict)
     backbone = model.eval()
     # 移除分类头 + 开池化
-    if hasattr(backbone, 'reset_classifier'):
-        backbone.reset_classifier(num_classes=0, global_pool='avg')
+    #if hasattr(backbone, 'reset_classifier'):
+        #backbone.reset_classifier(num_classes=0, global_pool='avg')
 
-    model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
+    #model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
+    model = LogitsAsEmbedding(backbone, l2norm=True).to(device)
 
     # 2) 冻结前面一部分参数
     freeze_by_ratio(model.backbone, args.freeze_ratio)
     # head 全部训练
-    for p in model.head.parameters():
-        p.requires_grad = True
+    #for p in model.head.parameters():
+    #    p.requires_grad = True
+    if hasattr(model, "head"):
+        for p in model.head.parameters():
+            p.requires_grad = True
 
     # 3) 数据
     tf_train = transforms.Compose([
