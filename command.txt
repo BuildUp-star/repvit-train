@@ -151,3 +151,21 @@ python print_pos_pairs.py \
   --base_dir dataset/00train_test \
   --save_csv runs/pos_pairs_sorted.csv \
   --max_print 500
+  
+@train with supcon loss  
+  python train_from_existing_repvit.py \
+  --csv_dir dataset/00train_test \
+  --method supcon \
+  --model_name repvit_m1_0 \
+  --embed_dim 512 \
+  --mlp_head \
+  --freeze_ratio 0.8 \
+  --batch_size 64 \
+  --epochs 10 \
+  --lr 3e-4 \
+  --image_size 224 \
+  --temperature 0.1 \
+  --fp16
+  
+#create dataset for supcon. (probably have done this script already)
+ python make_supcon_csv.py   --roots ./corridor ./home ./market ./office ./restaurant ./station   --out_dir .   --train_ratio 0.8   --seed 42
