@@ -507,6 +507,11 @@ def main():
     ap.add_argument('--tpp_sigma', type=float, default=0.15, help='τ-聚焦的带宽 sigma（越小越聚焦边界）')
     ap.add_argument('--no_tau_focus', action='store_true', help='关闭 τ-聚焦权重（默认开启）')
     ap.add_argument('--temperature', type=float, default=0.1, help='SupCon/InfoNCE 温度τ')
+    # ---- 额外：初始化模型在 train.csv 上的阈值评测 ----
+    ap.add_argument('--eval_init_train', action='store_true',
+                    help='在训练开始前，用初始化模型对 train.csv 扫阈值并打印最佳 F1')
+    ap.add_argument('--only_eval_init_train', action='store_true',
+                    help='只做初始化评测（train.csv），评测后直接退出，不进入训练')
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -542,8 +547,8 @@ def main():
     #if hasattr(backbone, 'reset_classifier'):
         #backbone.reset_classifier(num_classes=0, global_pool='avg')
 
-    #model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
-    model = LogitsAsEmbedding(backbone, l2norm=True).to(device)
+    model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
+    #model = LogitsAsEmbedding(backbone, l2norm=True).to(device)
 
     # 2) 冻结前面一部分参数
     freeze_by_ratio(model.backbone, args.freeze_ratio)
@@ -553,6 +558,26 @@ def main():
     if hasattr(model, "head"):
         for p in model.head.parameters():
             p.requires_grad = True
+
+    # === 初始化模型在 train.csv 上的阈值评测（可选） ===
+    if args.eval_init_train or args.only_eval_init_train:
+        train_csv_path = os.path.join(args.csv_dir, 'test.csv')
+        if os.path.exists(train_csv_path):
+            print("\n[Init-Eval] 开始在 train.csv 上评测初始化模型（扫阈值 0.20~0.99） ...")
+            init_report = eval_threshold_metrics(
+                model, train_csv_path, args.image_size, device,
+                thr_list=None,           # 默认 linspace(0.2,0.99,80)
+                pos_rule="same_group",
+                max_pairs=1_000_000,
+                min_index_gap=0
+            )
+            print(f"[Init-Eval@train.csv] best τ* = {init_report['best']['thr']:.3f}  "
+                  f"(F1={init_report['best']['f1']:.3f})")
+        else:
+            print(f"[Init-Eval] 未找到 {train_csv_path}，跳过初始化评测。")
+        if args.only_eval_init_train:
+            print("[Init-Eval] 仅评测模式已完成，程序退出。")
+            return
 
     # 3) 数据
     tf_train = transforms.Compose([
@@ -768,6 +793,15 @@ def eval_threshold_metrics(model, test_csv, image_size, device,
         embs.append(z); groups.append(gid); paths.append(path)
     embs = np.stack(embs, 0)
     embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
+    
+    #print 3 embeddings
+    np.set_printoptions(threshold=np.inf, linewidth=200, precision=5, suppress=True)
+    sample_ids = random.sample(range(len(embs)), k=min(3, len(embs)))
+    print("\n=== Random 3 Embeddings ===")
+    for i in sample_ids:
+        print(f"[{i}] group={groups[i]}  path={paths[i]}")
+        print(embs[i])  # 全量打印 embedding
+        print("-" * 80)
 
     N = len(embs)
     sims = embs @ embs.T

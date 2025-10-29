@@ -169,3 +169,10 @@ python print_pos_pairs.py \
   
 #create dataset for supcon. (probably have done this script already)
  python make_supcon_csv.py   --roots ./corridor ./home ./market ./office ./restaurant ./station   --out_dir .   --train_ratio 0.8   --seed 42
+ 
+ 
+ #test inital F1 score
+ python train_from_existing_repvit.py \
+  --csv_dir dataset/00train_test \
+  --model_name repvit_m1_0 \
+  --eval_init_train --only_eval_init_train
