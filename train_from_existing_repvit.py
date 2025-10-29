@@ -31,6 +31,40 @@ def set_seed(seed=42):
 def normalize(z): return F.normalize(z, dim=-1)
 
 # ----------------- datasets -----------------
+# -------- SupCon dataset (CSV: path,class,group) --------
+class TransformTwice:
+    def __init__(self, tfm): self.tfm = tfm
+    def __call__(self, img): return self.tfm(img), self.tfm(img)
+
+class SupConCSVDataset(Dataset):
+    """
+    从 train.csv 读取每张图片的 (path, class, group)，
+    返回两次随机增强的 view1, view2，以及整数化的 group_id
+    """
+    def __init__(self, csv_path, transform):
+        base = os.path.dirname(os.path.abspath(csv_path))
+        def _resolve(p): return p if os.path.isabs(p) else os.path.join(base, p)
+
+        rows = []
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            for r in csv.DictReader(f):
+                rows.append((_resolve(r['path']), f"{r['class']}/{r['group']}"))
+
+        # 将 "class/group" 映射成连续的整数 id
+        gids = sorted({g for _, g in rows})
+        self.gid_map = {g:i for i,g in enumerate(gids)}
+        self.items = [(p, self.gid_map[g]) for p, g in rows]
+        self.tfm2 = TransformTwice(transform)
+
+    def __len__(self): return len(self.items)
+
+    def __getitem__(self, i):
+        p, gid = self.items[i]
+        img = Image.open(p).convert('RGB')
+        v1, v2 = self.tfm2(img)
+        return v1, v2, torch.tensor(gid, dtype=torch.long)
+
+
 class PairDataset(Dataset):
     def __init__(self, pos_csv, neg_csv, transform):
         import csv, os
@@ -201,6 +235,46 @@ def freeze_by_ratio(module: nn.Module, ratio: float):
         p.requires_grad = (i >= cutoff)
 
 # ----------------- losses -----------------
+class SupConLoss(nn.Module):
+    """
+    Supervised Contrastive Loss:
+    输入 Z:[B,D], labels:[B]；同 label 皆为正样本，其余为负（自身不计）
+    可与双视图拼接一起用：Z=cat(z1,z2), labels=cat(g,g)
+    """
+    def __init__(self, temperature=0.1, normalize=True):
+        super().__init__()
+        self.tau = float(temperature)
+        self.normalize = normalize
+
+    def forward(self, Z: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        assert Z.dim()==2 and labels.dim()==1 and Z.size(0)==labels.size(0)
+        if self.normalize:
+            Z = F.normalize(Z, dim=1)
+
+        B = Z.size(0)
+        sim = (Z @ Z.t()) / self.tau                   # [B,B]
+        # 自身不参与对比
+        sim = sim.masked_fill(torch.eye(B, dtype=torch.bool, device=Z.device), float('-inf'))
+
+        # 构造正样本掩码（自身为 False）
+        labels = labels.view(-1,1)
+        pos_mask = (labels == labels.t()) & (~torch.eye(B, dtype=torch.bool, device=Z.device))
+        pos_mask = pos_mask.float()
+
+        # 分母：所有（非自身）样本
+        log_denom = torch.logsumexp(sim, dim=1)        # [B]
+
+        # 分子：对所有正样本做 logsumexp（无正样本的行将被忽略）
+        # 将非正样本置为 -inf：用 log(pos_mask) 实现（0→-inf, 1→0）
+        log_pos = sim + torch.log(pos_mask + 1e-12)
+        log_num = torch.logsumexp(log_pos, dim=1)      # [B]
+
+        # 只统计有正样本的行
+        valid = (pos_mask.sum(dim=1) > 0).float()      # [B]
+        loss = -(log_num - log_denom) * valid
+        loss = loss.sum() / (valid.sum() + 1e-12)
+        return loss
+
 class BCEPairLossB(nn.Module):
     def __init__(self, scale=20.0):
         super().__init__()
@@ -405,7 +479,8 @@ def eval_group_metrics(model, test_csv, image_size, device, save_confusion_csv=N
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--csv_dir', type=str, default='dataset/00train_test')
-    ap.add_argument('--method', type=str, choices=['triplet','pairs-bce','pairs-tpp'], default='triplet')
+    #ap.add_argument('--method', type=str, choices=['triplet','pairs-bce','pairs-tpp'], default='triplet')
+    ap.add_argument('--method', type=str, choices=['triplet','pairs-bce','pairs-tpp','supcon'], default='supcon')
     ap.add_argument('--model_name', type=str, default='repvit_m1_0')
     ap.add_argument('--embed_dim', type=int, default=512)
     ap.add_argument('--freeze_ratio', type=float, default=0.8, help='冻结前多少比例参数 (0~1)')
@@ -431,7 +506,7 @@ def main():
     ap.add_argument('--tpp_push',  type=float, default=0.2,  help='负样本推远权重 λ_push')
     ap.add_argument('--tpp_sigma', type=float, default=0.15, help='τ-聚焦的带宽 sigma（越小越聚焦边界）')
     ap.add_argument('--no_tau_focus', action='store_true', help='关闭 τ-聚焦权重（默认开启）')
-
+    ap.add_argument('--temperature', type=float, default=0.1, help='SupCon/InfoNCE 温度τ')
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -489,7 +564,14 @@ def main():
         transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
     ])
 
-    if args.method == 'triplet':
+    if args.method == 'supcon':
+        train_csv = os.path.join(args.csv_dir, 'train.csv')
+        ds = SupConCSVDataset(train_csv, tf_train)
+        dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                        num_workers=args.num_workers, pin_memory=pin_mem, drop_last=True)
+        criterion = SupConLoss(temperature=args.temperature, normalize=True)
+
+    elif args.method == 'triplet':
         tri_csv = os.path.join(args.csv_dir, 'triplets.csv')
         ds = TripletDataset(tri_csv, tf_train)
         dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
@@ -539,7 +621,14 @@ def main():
             bsz = batch[0].size(0)  # 当前 batch 大小
             #with torch.cuda.amp.autocast(enabled=args.fp16):
             with amp_autocast():
-                if args.method == 'triplet':
+                if args.method == 'supcon':
+                    v1, v2, g = batch
+                    v1, v2, g = v1.to(device), v2.to(device), g.to(device)
+                    z1, z2 = model(v1), model(v2)                   # [B,D],[B,D]
+                    Z  = torch.cat([z1, z2], dim=0)                 # [2B,D]
+                    G  = torch.cat([g,  g ], dim=0)                 # [2B]
+                    loss = criterion(Z, G)
+                elif args.method == 'triplet':
                     xa, xp, xn = [t.to(device) for t in batch]
                     za, zp, zn = model(xa), model(xp), model(xn)
                     loss = criterion(za, zp, zn)
