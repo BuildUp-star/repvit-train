@@ -640,58 +640,8 @@ def main():
         loss_acc = 0.0
         it_cnt = 0
         seen_images = 0
-
-        for it, batch in enumerate(dl, start=1):
-            optim.zero_grad(set_to_none=True)
-            bsz = batch[0].size(0)  # 当前 batch 大小
-            #with torch.cuda.amp.autocast(enabled=args.fp16):
-            with amp_autocast():
-                if args.method == 'supcon':
-                    v1, v2, g = batch
-                    v1, v2, g = v1.to(device), v2.to(device), g.to(device)
-                    z1, z2 = model(v1), model(v2)                   # [B,D],[B,D]
-                    Z  = torch.cat([z1, z2], dim=0)                 # [2B,D]
-                    G  = torch.cat([g,  g ], dim=0)                 # [2B]
-                    loss = criterion(Z, G)
-                elif args.method == 'triplet':
-                    xa, xp, xn = [t.to(device) for t in batch]
-                    za, zp, zn = model(xa), model(xp), model(xn)
-                    loss = criterion(za, zp, zn)
-                else:
-                    xa, xb, y = batch
-                    xa, xb, y = xa.to(device), xb.to(device), y.to(device)
-                    za, zb = model(xa), model(xb)
-                    loss = criterion(za, zb, y)
-
-            scaler.scale(loss).backward()
-            scaler.step(optim); scaler.update()
-
-            # 累计指标
-            it_cnt += 1
-            seen_images += bsz
-            loss_acc += loss.item()
-
-            # === 心跳日志：每 args.log_every_sec 秒输出一次 ===
-            now = time.time()
-            if now - last_log >= args.log_every_sec:
-                elapsed = now - t0
-                avg_loss = loss_acc / it_cnt
-                ips = seen_images / max(elapsed, 1e-9)  # images per second
-                # 预估本 epoch ETA
-                total_it = len(dl)
-                eta_epoch = (elapsed / max(it_cnt,1)) * (total_it - it_cnt)
-                print(f"[Epoch {ep} | {it_cnt}/{total_it}] "
-                      f"avg_loss={avg_loss:.4f}  "
-                      f"speed={ips:.1f} img/s  "
-                      f"eta_epoch={eta_epoch:.1f}s")
-                last_log = now
-
-        # --- 一个 epoch 结束 ---
-        dt = time.time() - t0
-        epoch_loss = loss_acc / max(it_cnt,1)
-        print(f"[Epoch {ep} DONE] loss={epoch_loss:.4f}  time={dt:.1f}s")
-
-        # 轻量评测（组内最近邻召回）
+        
+                # 轻量评测（组内最近邻召回）
         test_csv = os.path.join(args.csv_dir, 'test.csv')
         metrics = eval_group_metrics(
             model, test_csv, args.image_size, device,
@@ -748,6 +698,58 @@ def main():
             if args.patience > 0 and epochs_no_improve >= args.patience:
                 print(f"[EarlyStop] 连续 {args.patience} 个 epoch 指标未提升，提前停止。")
                 break
+
+        for it, batch in enumerate(dl, start=1):
+            optim.zero_grad(set_to_none=True)
+            bsz = batch[0].size(0)  # 当前 batch 大小
+            #with torch.cuda.amp.autocast(enabled=args.fp16):
+            with amp_autocast():
+                if args.method == 'supcon':
+                    v1, v2, g = batch
+                    v1, v2, g = v1.to(device), v2.to(device), g.to(device)
+                    z1, z2 = model(v1), model(v2)                   # [B,D],[B,D]
+                    Z  = torch.cat([z1, z2], dim=0)                 # [2B,D]
+                    G  = torch.cat([g,  g ], dim=0)                 # [2B]
+                    loss = criterion(Z, G)
+                elif args.method == 'triplet':
+                    xa, xp, xn = [t.to(device) for t in batch]
+                    za, zp, zn = model(xa), model(xp), model(xn)
+                    loss = criterion(za, zp, zn)
+                else:
+                    xa, xb, y = batch
+                    xa, xb, y = xa.to(device), xb.to(device), y.to(device)
+                    za, zb = model(xa), model(xb)
+                    loss = criterion(za, zb, y)
+
+            scaler.scale(loss).backward()
+            scaler.step(optim); scaler.update()
+
+            # 累计指标
+            it_cnt += 1
+            seen_images += bsz
+            loss_acc += loss.item()
+
+            # === 心跳日志：每 args.log_every_sec 秒输出一次 ===
+            now = time.time()
+            if now - last_log >= args.log_every_sec:
+                elapsed = now - t0
+                avg_loss = loss_acc / it_cnt
+                ips = seen_images / max(elapsed, 1e-9)  # images per second
+                # 预估本 epoch ETA
+                total_it = len(dl)
+                eta_epoch = (elapsed / max(it_cnt,1)) * (total_it - it_cnt)
+                print(f"[Epoch {ep} | {it_cnt}/{total_it}] "
+                      f"avg_loss={avg_loss:.4f}  "
+                      f"speed={ips:.1f} img/s  "
+                      f"eta_epoch={eta_epoch:.1f}s")
+                last_log = now
+
+        # --- 一个 epoch 结束 ---
+        dt = time.time() - t0
+        epoch_loss = loss_acc / max(it_cnt,1)
+        print(f"[Epoch {ep} DONE] loss={epoch_loss:.4f}  time={dt:.1f}s")
+
+
 
 
         # 常规保存（每个 epoch）
