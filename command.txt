@@ -176,3 +176,5 @@ python print_pos_pairs.py \
   --csv_dir dataset/00train_test \
   --model_name repvit_m1_0 \
   --eval_init_train --only_eval_init_train
+  
+  --load runs/repvit_supcon_best.pt \

@@ -549,8 +549,11 @@ def main():
     #if hasattr(backbone, 'reset_classifier'):
         #backbone.reset_classifier(num_classes=0, global_pool='avg')
 
-    model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
+    #model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
+    #model = LogitsAsEmbedding(backbone, l2norm=True).to(device);
+    model = RepViTWithHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
     if args.load:
+        print(f"Loading from {args.load}")
         print(f"Loading from {args.load}")
         ckpt = torch.load(args.load, map_location=device)
         model.load_state_dict(ckpt["model"], strict=False)
@@ -804,6 +807,7 @@ def eval_threshold_metrics(model, test_csv, image_size, device,
     embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
     
     #print 3 embeddings
+    '''
     np.set_printoptions(threshold=np.inf, linewidth=200, precision=5, suppress=True)
     sample_ids = random.sample(range(len(embs)), k=min(3, len(embs)))
     print("\n=== Random 3 Embeddings ===")
@@ -811,6 +815,7 @@ def eval_threshold_metrics(model, test_csv, image_size, device,
         print(f"[{i}] group={groups[i]}  path={paths[i]}")
         print(embs[i])  # 全量打印 embedding
         print("-" * 80)
+    '''
 
     N = len(embs)
     sims = embs @ embs.T
