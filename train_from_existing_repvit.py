@@ -507,6 +507,8 @@ def main():
     ap.add_argument('--tpp_sigma', type=float, default=0.15, help='τ-聚焦的带宽 sigma（越小越聚焦边界）')
     ap.add_argument('--no_tau_focus', action='store_true', help='关闭 τ-聚焦权重（默认开启）')
     ap.add_argument('--temperature', type=float, default=0.1, help='SupCon/InfoNCE 温度τ')
+    #load ?
+    ap.add_argument("--load", type=str, default="", help="path to pretrained checkpoint")
     # ---- 额外：初始化模型在 train.csv 上的阈值评测 ----
     ap.add_argument('--eval_init_train', action='store_true',
                     help='在训练开始前，用初始化模型对 train.csv 扫阈值并打印最佳 F1')
@@ -548,6 +550,11 @@ def main():
         #backbone.reset_classifier(num_classes=0, global_pool='avg')
 
     model = RepViTWithLogitHead(backbone, embed_dim=args.embed_dim, mlp=args.mlp_head).to(device)
+    if args.load:
+        print(f"Loading from {args.load}")
+        ckpt = torch.load(args.load, map_location=device)
+        model.load_state_dict(ckpt["model"], strict=False)
+        print(f"✅ Loaded checkpoint (epoch={ckpt.get('epoch', '?')})")
     #model = LogitsAsEmbedding(backbone, l2norm=True).to(device)
 
     # 2) 冻结前面一部分参数
