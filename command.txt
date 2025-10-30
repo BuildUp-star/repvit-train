@@ -162,7 +162,7 @@ python print_pos_pairs.py \
   --freeze_ratio 0.8 \
   --batch_size 64 \
   --epochs 10 \
-  --lr 3e-4 \
+  --lr 3e-7 \
   --image_size 224 \
   --temperature 0.1 \
   --fp16
@@ -178,3 +178,55 @@ python print_pos_pairs.py \
   --eval_init_train --only_eval_init_train
   
   --load runs/repvit_supcon_best.pt \
+  
+  calib_list.txt
+/path/to/img1.rgb
+/path/to/img2.rgb
+...
+
+3) 用 QNN 转换 ONNX → QNN 源（供编译）
+$QNN_SDK_ROOT/bin/x86_64-linux-clang/qnn-onnx-converter \
+  --input_network repvit512.onnx \
+  --output_path build_qnn/repvit512 \
+  --quantization_type a8w8 \
+  --input_list calib_list.txt \
+  --input_layouts "input:NCHW" \
+  --output_tensors "emb"
+  
+  4) 生成 Model Lib（把模型编成一个可分发的 .so）
+$QNN_SDK_ROOT/bin/x86_64-linux-clang/qnn-model-lib-generator \
+  --model build_qnn/repvit512/repvit512.cpp \
+  --binary build_qnn/repvit512/repvit512.bin \
+  --output_dir build_qnn/repvit512/mlib_htp \
+  --backend htp \
+  --system android-aarch64
+  
+  5) Android 侧集成（合入你的 6dof.so）
+A. CMake 示例（把模型 lib 和 QNN runtime 链到 6dof.so）
+# CMakeLists.txt (excerpt)
+set(QNN_ROOT $ENV{QNN_SDK_ROOT})
+add_library(qnn_model SHARED IMPORTED)
+set_target_properties(qnn_model PROPERTIES
+  IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/app/src/main/jniLibs/arm64-v8a/libQnnRepvit512_htp.so")
+
+# QNN 运行库（示例：libQnnHtp.so、libQnnSystem.so 等，放到 jniLibs/arm64-v8a）
+add_library(qnn_htp    SHARED IMPORTED)
+set_target_properties(qnn_htp PROPERTIES IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/app/src/main/jniLibs/arm64-v8a/libQnnHtp.so")
+add_library(qnn_system SHARED IMPORTED)
+set_target_properties(qnn_system PROPERTIES IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/app/src/main/jniLibs/arm64-v8a/libQnnSystem.so")
+
+add_library(6dof SHARED
+  src/6dof_main.cpp
+  src/qnn_runner.cpp)  # 你写的封装
+
+target_link_libraries(6dof
+  qnn_model qnn_htp qnn_system
+  log android)
+
+B. 运行时最小调用骨架（C++）
+// qnn_runner.cpp (示意)
+#include "QnnApi.hpp"  // QNN SDK 头
+// 1) 初始化 backend & context
+// 2) 从 Model Lib 创建 graph
+// 3) 准备输入/输出 tensor（NHWC/NCHW按你转换时约定）
+// 4) qnn_graph_execute(); 拿到512-d输出
